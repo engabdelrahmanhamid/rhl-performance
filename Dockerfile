@@ -1,3 +1,6 @@
+# ملاحظة: هذا ليس مسار النشر الفعلي للإنتاج (الإنتاج على Hostinger Cloud Startup -
+# استضافة Node.js مُدارة بلا Docker/root SSH - + Supabase Postgres خارجية، انظر HANDOFF.md §9).
+# هذا الملف مُبقًى فقط كخيار بديل لتشغيل ذاتي (Self-hosted) مستقبلي إن احتِيج إليه.
 FROM node:20-bookworm-slim AS base
 WORKDIR /app
 # Debian (glibc) بدل Alpine (musl) - ثنائي Chromium الخاص بـPlaywright (تصدير PDF) غير متوافق مع musl.

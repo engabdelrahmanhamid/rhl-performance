@@ -1,11 +1,18 @@
 /**
- * توليد PDF عبر Chromium بلا واجهة (Playwright) بدل مكتبات PDF الخفيفة - §تصدير PDF/Excel
- * من HANDOFF §5.7. القرار: مكتبات مثل pdfkit/react-pdf لا تدعم تشكيل الحروف العربية
- * (Shaping/Ligatures) فتظهر النصوص العربية منفصلة وغير مقروءة. Chromium يستخدم نفس محرك
- * العرض الذي يعرض الواجهة بشكل صحيح بالفعل، فيضمن نصًا عربيًا مطابقًا تمامًا لما يظهر شاشة.
+ * توليد PDF من نفس قوالب HTML المستخدَمة للعرض - بدل مكتبات PDF الخفيفة (pdfkit/react-pdf)
+ * التي لا تدعم تشكيل الحروف العربية (Shaping/Ligatures) فتُخرِج نصًا عربيًا منفصلًا وغير مقروء.
+ * القالب نفسه (reportHtmlShell + escapeHtml) هو مصدر الحقيقة الوحيد؛ ما يتغيّر هو فقط أي محرك
+ * يُحوِّله إلى PDF - محليًا (Playwright) أو خارجيًا (Browserless) - كلاهما Chromium حقيقي
+ * فتكون جودة تشكيل النص العربي مطابقة تمامًا بصرف النظر عن المحرك المُختار.
  *
- * ملاحظة نشر: على Alpine (musl) ثنائي Chromium الخاص بـPlaywright غير متوافق - لذلك صورة
- * Docker (انظر Dockerfile) تستخدم قاعدة Debian (glibc) بدل Alpine خصيصًا لهذا السبب.
+ * محرك قابل للتبديل عبر PDF_ENGINE لأن استضافة Hostinger المُدارة (Cloud Startup) لا تضمن
+ * توفر Chromium على مستوى نظام التشغيل - هذا افتراض غير مضمون ويجب التحقق منه فعليًا بعد
+ * النشر (حاول تصدير PDF حقيقي؛ إن ظهرت رسالة الخطأ أدناه فبدّل إلى PDF_ENGINE=browserless):
+ *   - PDF_ENGINE=playwright (افتراضي): يشغّل Chromium محليًا عبر Playwright. يعمل مؤكَّدًا
+ *     في التطوير المحلي (تم التحقق فعليًا). قد لا يعمل في بيئة استضافة مُدارة بلا صلاحية
+ *     تثبيت مكتبات نظام (مثل ما يحتاجه Chromium: fonts, libnss3, ...).
+ *   - PDF_ENGINE=browserless: يستدعي خدمة Browserless.io (Headless Chrome كخدمة خارجية عبر
+ *     HTTP) - يتطلب BROWSERLESS_API_KEY. لا حاجة لتثبيت أي شيء على السيرفر.
  */
 
 import { chromium } from "playwright";
@@ -14,20 +21,50 @@ export function escapeHtml(value: string | number): string {
   return String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
+const PDF_MARGIN = { top: "18mm", bottom: "16mm", left: "14mm", right: "14mm" };
+
 export async function renderHtmlToPdf(html: string): Promise<Buffer> {
-  const browser = await chromium.launch({ headless: true });
+  const engine = (process.env.PDF_ENGINE ?? "playwright").toLowerCase();
+  return engine === "browserless" ? renderViaBrowserless(html) : renderViaPlaywright(html);
+}
+
+async function renderViaPlaywright(html: string): Promise<Buffer> {
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (err) {
+    throw new Error(
+      "تعذّر تشغيل Chromium محليًا عبر Playwright - متوقَّع في بيئة استضافة مُدارة بلا صلاحية تثبيت مكتبات نظام. " +
+        'اضبط متغيّر البيئة PDF_ENGINE=browserless مع BROWSERLESS_API_KEY بدل ذلك. الخطأ الأصلي: ' +
+        (err instanceof Error ? err.message : String(err))
+    );
+  }
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle" });
-    const buffer = await page.pdf({
-      format: "A4",
-      printBackground: true,
-      margin: { top: "18mm", bottom: "16mm", left: "14mm", right: "14mm" },
-    });
-    return buffer;
+    return await page.pdf({ format: "A4", printBackground: true, margin: PDF_MARGIN });
   } finally {
     await browser.close();
   }
+}
+
+async function renderViaBrowserless(html: string): Promise<Buffer> {
+  const apiKey = process.env.BROWSERLESS_API_KEY;
+  if (!apiKey) throw new Error("BROWSERLESS_API_KEY غير مضبوط - مطلوب عند PDF_ENGINE=browserless");
+
+  const endpoint = process.env.BROWSERLESS_URL ?? "https://chrome.browserless.io";
+  const res = await fetch(`${endpoint}/pdf?token=${encodeURIComponent(apiKey)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ html, options: { format: "A4", printBackground: true, margin: PDF_MARGIN } }),
+  });
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`فشل توليد PDF عبر Browserless (HTTP ${res.status}): ${detail.slice(0, 300)}`);
+  }
+
+  return Buffer.from(await res.arrayBuffer());
 }
 
 export function reportHtmlShell(title: string, bodyHtml: string): string {

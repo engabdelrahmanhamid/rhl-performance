@@ -11,9 +11,14 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// DATABASE_URL: اتصال مُجمَّع (Pooled - عبر pgbouncer، المنفذ 6543 في Supabase) تستخدمه
+// الواجهة وقت التشغيل. DIRECT_URL: اتصال مباشر (المنفذ 5432) تحتاجه Prisma حصرًا وقت
+// Migrate/Deploy لأن pgbouncer في وضع Transaction لا يدعم بعض أوامر الجلسة التي تحتاجها
+// الهجرات - هذا نمط Supabase الموصى به رسميًا مع Prisma، وليس اختياريًا.
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ==========================================================================
