@@ -1,0 +1,705 @@
+// RHL Performance Management System — Prisma Schema (v2)
+// نموذج مُعاد تصميمه بعد المراجعة المعمارية: يفصل بين
+//   - PerformanceReview  (الموظف × الدورة - الكيان الأب)
+//   - ReviewEvaluator    (مقيّم واحد داخل مراجعة أداء واحدة - تعيين مجمَّد لدورة محددة)
+//   - ReviewKpiActual    (القيمة الموضوعية المشتركة لكل مؤشر رقمي - لا تتكرر لكل مقيّم)
+//   - ReviewEvaluatorItem (التقييم الذاتي/الرأي الخاص بكل مقيّم: Rating + تبرير)
+// مع تجميد كامل (Snapshot) لإعدادات الدورة عند فتحها، بحيث لا تتأثر النتائج التاريخية
+// بأي تعديل لاحق على الموظف/القالب/الأهداف/التعيينات.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================================================
+// Enums
+// ==========================================================================
+
+enum UserRole {
+  SUPER_ADMIN
+  EVALUATOR
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CycleStatus {
+  DRAFT
+  UPCOMING
+  OPEN
+  CLOSED
+}
+
+/// حالة مساهمة مقيّم واحد داخل مراجعة أداء (ReviewEvaluator).
+enum EvaluatorSubmissionStatus {
+  NOT_STARTED
+  DRAFT
+  SUBMITTED
+  REOPENED
+}
+
+/// حالة مراجعة الأداء الكاملة للموظف (تجميع كل المقيّمين).
+enum ReviewStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  AWAITING_EVALUATIONS // بعض المقيّمين أرسلوا، والبعض الآخر لم يكمل بعد - لا نتيجة نهائية رسمية
+  COMPLETED // كل المقيّمين أرسلوا ومجموع أوزانهم 100% - النتيجة النهائية معتمدة
+}
+
+enum MeasurementType {
+  NUMBER
+  PERCENTAGE
+  CURRENCY
+  RATING_1_5
+  SUBCRITERIA_RATING
+}
+
+enum KpiDirection {
+  HIGHER_IS_BETTER
+  LOWER_IS_BETTER
+}
+
+/// مستوى نطاق الهدف - يُستخدم لبناء scopeKey الطبيعي ولمنع تكرار الأهداف منطقيًا.
+enum TargetScopeType {
+  GLOBAL
+  BRANCH
+  DEPARTMENT
+  JOB_TITLE
+  EMPLOYEE
+}
+
+/// PER_EMPLOYEE: يخضع لهرمية الحل (Employee -> JobTitle -> Department -> Branch -> Global)
+/// ويصبح هدفًا فرديًا فعليًا لكل موظف يقابله.
+/// AGGREGATE: رقم إجمالي لفرع/قسم لأغراض التقارير فقط - لا يُورَّث تلقائيًا كهدف فردي.
+enum TargetApplicationMode {
+  PER_EMPLOYEE
+  AGGREGATE
+}
+
+enum ActualSource {
+  MANUAL
+  EXTERNAL_API
+}
+
+enum ImportRowStatus {
+  READY
+  WARNING
+  ERROR
+}
+
+enum AggregationMethod {
+  SUM
+  AVERAGE
+  COUNT
+  PERCENTAGE
+  CUSTOM
+}
+
+// ==========================================================================
+// RBAC: أدوار + صلاحيات دقيقة قابلة للتوسع + نطاق منفصل تمامًا عن الصلاحيات
+// ==========================================================================
+
+model User {
+  id                 String    @id @default(cuid())
+  fullName           String
+  email              String    @unique
+  passwordHash       String
+  role               UserRole
+  isActive           Boolean   @default(true)
+  /// يُفرَض تغيير كلمة المرور بعد إعادة تعيينها يدويًا من الإدارة - §20 من المراجعة.
+  mustChangePassword Boolean   @default(false)
+  /// المقيّم قد يكون موظفًا داخل المكتب - اختياري ويبقى فارغًا لحسابات الإدارة/النظام.
+  employeeId         String?   @unique
+  employee           Employee? @relation(fields: [employeeId], references: [id])
+  lastLoginAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  permissions          UserPermission[]
+  assignments          EvaluatorAssignment[] @relation("AssignedEvaluator")
+  reviewEvaluations    ReviewEvaluator[]      @relation("ReviewEvaluatorUser")
+  enteredActuals       ReviewKpiActual[]      @relation("ActualEnteredBy")
+  auditLogs            AuditLog[]
+  notifications        Notification[]
+  uploadedAttachments  ReviewAttachment[]
+  comments             ReviewComment[]
+
+  @@map("users")
+}
+
+/// كتالوج الصلاحيات الدقيقة - يُدار كسجلات وليس Enum ثابت لسهولة التوسع دون Migration.
+model Permission {
+  code        String @id // مثال: evaluation.perform
+  description String
+
+  users UserPermission[]
+
+  @@map("permissions")
+}
+
+model UserPermission {
+  userId         String
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permissionCode String
+  permission     Permission @relation(fields: [permissionCode], references: [code], onDelete: Cascade)
+  grantedAt      DateTime   @default(now())
+
+  @@id([userId, permissionCode])
+  @@map("user_permissions")
+}
+
+// ==========================================================================
+// الهيكل التنظيمي
+// ==========================================================================
+
+model Branch {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  code      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  employees        Employee[]
+  branchDepartments BranchDepartment[]
+  targets          Target[]
+  assignmentRules  EvaluatorAssignmentRule[]
+
+  @@map("branches")
+}
+
+/// الأقسام كيانات تنظيمية مستقلة عن الفرع (مثال: "خدمة العملاء" قسم واحد
+/// يظهر في كل الفروع)، وليست منسوخة لكل فرع. BranchDepartment اختياري ويُستخدم
+/// فقط إذا احتجنا لضبط أي الأقسام متاحة فعليًا في أي فرع.
+model Department {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  employees        Employee[]
+  branchDepartments BranchDepartment[]
+  targets          Target[]
+  assignmentRules  EvaluatorAssignmentRule[]
+
+  @@map("departments")
+}
+
+model BranchDepartment {
+  branchId     String
+  branch       Branch     @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@id([branchId, departmentId])
+  @@map("branch_departments")
+}
+
+model JobTitle {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  employees       Employee[]
+  kpiTemplates    KpiTemplate[]
+  targets         Target[]
+  assignmentRules EvaluatorAssignmentRule[]
+
+  @@map("job_titles")
+}
+
+model Employee {
+  id               String           @id @default(cuid())
+  employeeNumber   String           @unique
+  fullName         String
+  branchId         String
+  branch           Branch           @relation(fields: [branchId], references: [id])
+  departmentId     String?
+  department       Department?      @relation(fields: [departmentId], references: [id])
+  jobTitleId       String
+  jobTitle         JobTitle         @relation(fields: [jobTitleId], references: [id])
+  employmentStatus EmploymentStatus @default(ACTIVE)
+  hireDate         DateTime
+  email            String?
+  phone            String?
+  notes            String?
+  externalRefId    String?
+  archivedAt       DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  userAccount         User?
+  targets             Target[]
+  performanceReviews  PerformanceReview[]
+  assignedAsSpecific  EvaluatorAssignmentEmployee[]
+
+  @@index([branchId])
+  @@index([departmentId])
+  @@index([jobTitleId])
+  @@index([employmentStatus])
+  @@map("employees")
+}
+
+// ==========================================================================
+// مقاييس التقارير الموحّدة (ReportingMetric) - §12 من المراجعة
+// تسمح بربط مؤشرات KPI مختلفة عبر قوالب مختلفة بمقياس تقرير واحد قابل للتجميع.
+// ==========================================================================
+
+model ReportingMetric {
+  code              String            @id // مثال: REVENUE, SESSIONS, CUSTOMER_SATISFACTION
+  name              String
+  unit              String?
+  aggregationMethod AggregationMethod
+
+  kpis Kpi[]
+
+  @@map("reporting_metrics")
+}
+
+// ==========================================================================
+// KPI Templates
+// ==========================================================================
+
+model KpiTemplate {
+  id         String   @id @default(cuid())
+  jobTitleId String
+  jobTitle   JobTitle @relation(fields: [jobTitleId], references: [id])
+  name       String
+  version    Int      @default(1)
+  isActive   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  kpis    Kpi[]
+  reviews PerformanceReview[]
+
+  @@unique([jobTitleId, version])
+  @@index([jobTitleId, isActive])
+  @@map("kpi_templates")
+}
+
+model Kpi {
+  id                      String           @id @default(cuid())
+  kpiTemplateId           String
+  kpiTemplate             KpiTemplate      @relation(fields: [kpiTemplateId], references: [id])
+  name                    String
+  description             String?
+  weight                  Decimal          @db.Decimal(5, 2)
+  measurementType         MeasurementType
+  direction               KpiDirection     @default(HIGHER_IS_BETTER)
+  measurementInstructions String?
+  reportingMetricCode     String?
+  reportingMetric         ReportingMetric? @relation(fields: [reportingMetricCode], references: [code])
+  isActive                Boolean          @default(true)
+  sortOrder               Int              @default(0)
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+
+  subcriteria KpiSubcriterion[]
+  targets     Target[]
+  actuals     ReviewKpiActual[]
+  items       ReviewEvaluatorItem[]
+
+  @@index([kpiTemplateId])
+  @@map("kpis")
+}
+
+model KpiSubcriterion {
+  id          String   @id @default(cuid())
+  kpiId       String
+  kpi         Kpi      @relation(fields: [kpiId], references: [id])
+  name        String
+  description String?
+  weight      Decimal? @db.Decimal(5, 2)
+  sortOrder   Int      @default(0)
+
+  scores ReviewEvaluatorSubcriterionScore[]
+
+  @@index([kpiId])
+  @@map("kpi_subcriteria")
+}
+
+// ==========================================================================
+// الأهداف — نموذج مُصحَّح: scopeKey طبيعي بدل الاعتماد على تفرّد NULL في Postgres،
+// مع FKs حقيقية للحقول المرجعية، وApplicationMode (فردي/إجمالي) - §10/§11 من المراجعة.
+// ==========================================================================
+
+model Target {
+  id              String                @id @default(cuid())
+  kpiId           String
+  kpi             Kpi                   @relation(fields: [kpiId], references: [id])
+  scopeType       TargetScopeType
+  /// مفتاح طبيعي فريد يُشتق من النطاق: "GLOBAL" | "BRANCH:<id>" | "DEPARTMENT:<id>" | "JOB_TITLE:<id>" | "EMPLOYEE:<id>"
+  scopeKey        String
+  branchId        String?
+  branch          Branch?               @relation(fields: [branchId], references: [id])
+  departmentId    String?
+  department      Department?           @relation(fields: [departmentId], references: [id])
+  jobTitleId      String?
+  jobTitle        JobTitle?             @relation(fields: [jobTitleId], references: [id])
+  employeeId      String?
+  employee        Employee?             @relation(fields: [employeeId], references: [id])
+  applicationMode TargetApplicationMode @default(PER_EMPLOYEE)
+  month           Int
+  year            Int
+  value           Decimal               @db.Decimal(14, 2)
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  @@unique([kpiId, scopeType, scopeKey, month, year])
+  @@index([kpiId, month, year])
+  @@map("targets")
+}
+
+// ==========================================================================
+// دورات التقييم
+// ==========================================================================
+
+model EvaluationCycle {
+  id          String      @id @default(cuid())
+  name        String
+  month       Int
+  year        Int
+  periodStart DateTime
+  periodEnd   DateTime
+  openDate    DateTime
+  deadline    DateTime
+  status      CycleStatus @default(DRAFT)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  reviews PerformanceReview[]
+
+  @@unique([month, year])
+  @@map("evaluation_cycles")
+}
+
+// ==========================================================================
+// قواعد تعيين المقيّمين (Reusable Rules) — تُقيَّم فقط لحظة فتح الدورة
+// لإنشاء ReviewEvaluator مجمَّد الوزن. تعديل القاعدة لاحقًا لا يغيّر دورات فُتحت
+// بالفعل - §3/§9 من المراجعة.
+// ==========================================================================
+
+model EvaluatorAssignment {
+  id          String   @id @default(cuid())
+  evaluatorId String
+  evaluator   User     @relation("AssignedEvaluator", fields: [evaluatorId], references: [id])
+  label       String?
+  /// الوزن الافتراضي الذي يُنسخ (Snapshot) إلى ReviewEvaluator.weightSnapshot عند فتح كل دورة.
+  defaultWeight Decimal  @db.Decimal(5, 2)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rules             EvaluatorAssignmentRule[]
+  specificEmployees EvaluatorAssignmentEmployee[]
+
+  @@index([evaluatorId])
+  @@map("evaluator_assignments")
+}
+
+/// قاعدة نطاق واحدة: كل الحقول المحددة داخل نفس القاعدة تُطبَّق بمنطق AND
+/// (مثال: Branch=جدة AND JobTitle=محامي مرخص). القواعد المتعددة تحت نفس
+/// EvaluatorAssignment تُجمَع بمنطق OR فيما بينها. isAllEmployees=true تعني
+/// "كل الموظفين" بلا قيد. لا يوجد userId هنا؛ المقيّم يُشتق من assignment.evaluatorId
+/// فقط - §4 من المراجعة.
+model EvaluatorAssignmentRule {
+  id           String              @id @default(cuid())
+  assignmentId String
+  assignment   EvaluatorAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  isAllEmployees Boolean           @default(false)
+  branchId     String?
+  branch       Branch?             @relation(fields: [branchId], references: [id])
+  departmentId String?
+  department   Department?         @relation(fields: [departmentId], references: [id])
+  jobTitleId   String?
+  jobTitle     JobTitle?           @relation(fields: [jobTitleId], references: [id])
+
+  @@index([assignmentId])
+  @@map("evaluator_assignment_rules")
+}
+
+/// موظفون محددون بالاسم يُضافون كقاعدة OR إضافية (بديل SPECIFIC_EMPLOYEES السابق).
+model EvaluatorAssignmentEmployee {
+  assignmentId String
+  assignment   EvaluatorAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  employeeId   String
+  employee     Employee            @relation(fields: [employeeId], references: [id])
+
+  @@id([assignmentId, employeeId])
+  @@map("evaluator_assignment_employees")
+}
+
+// ==========================================================================
+// PerformanceReview — الكيان الأب: موظف واحد × دورة واحدة، مع Snapshot كامل
+// للهيكل التنظيمي والقالب وقت الفتح - §2/§8/§9 من المراجعة.
+// ==========================================================================
+
+model PerformanceReview {
+  id         String          @id @default(cuid())
+  cycleId    String
+  cycle      EvaluationCycle @relation(fields: [cycleId], references: [id])
+  employeeId String
+  employee   Employee        @relation(fields: [employeeId], references: [id])
+
+  // --- Snapshot تنظيمي مجمَّد وقت فتح الدورة (لا يتغيّر بتغيّر بيانات الموظف لاحقًا) ---
+  employeeNumberSnapshot String
+  employeeNameSnapshot   String
+  branchIdSnapshot       String
+  branchNameSnapshot     String
+  departmentIdSnapshot   String?
+  departmentNameSnapshot String?
+  jobTitleIdSnapshot     String
+  jobTitleNameSnapshot   String
+
+  // --- Snapshot القالب ---
+  kpiTemplateId          String
+  kpiTemplate            KpiTemplate @relation(fields: [kpiTemplateId], references: [id])
+  templateVersionSnapshot Int
+
+  status               ReviewStatus @default(NOT_STARTED)
+  finalScore           Decimal?     @db.Decimal(4, 2)
+  finalPercentage      Decimal?     @db.Decimal(6, 2)
+  /// نص التصنيف وقت الاكتمال فقط - لا يتغيّر لاحقًا حتى لو عُدِّلت حدود PerformanceLabel.
+  performanceLabelSnapshot String?
+
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  evaluators   ReviewEvaluator[]
+  kpiActuals   ReviewKpiActual[]
+
+  @@unique([cycleId, employeeId])
+  @@index([cycleId, status])
+  @@map("performance_reviews")
+}
+
+/// ReviewKpiActual — القيمة الموضوعية (Actual) المشتركة لكل مؤشر رقمي داخل
+/// مراجعة أداء واحدة. سجل واحد فقط لكل (review, kpi) بصرف النظر عن عدد المقيّمين،
+/// بحيث لا تتضارب القيم الفعلية بين المقيّمين - §7 من المراجعة.
+/// يحمل أيضًا Snapshot الهدف والمؤشر المُجمَّدين وقت فتح الدورة.
+model ReviewKpiActual {
+  id       String            @id @default(cuid())
+  reviewId String
+  review   PerformanceReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  kpiId    String
+  kpi      Kpi               @relation(fields: [kpiId], references: [id])
+
+  // --- Snapshot المؤشر وقت الفتح ---
+  kpiNameSnapshot            String
+  kpiWeightSnapshot          Decimal          @db.Decimal(5, 2)
+  kpiDirectionSnapshot       KpiDirection
+  kpiMeasurementTypeSnapshot MeasurementType
+
+  // --- Snapshot الهدف المُحلَّل وقت الفتح (هرمية الأولوية - PER_EMPLOYEE فقط) ---
+  targetValueSnapshot      Decimal?        @db.Decimal(14, 2)
+  targetScopeLevelSnapshot TargetScopeType?
+  /// إن كان الهدف غير قابل للحل رياضيًا (مثال: Higher-Is-Better وTarget<=0)
+  isConfigurationError     Boolean         @default(false)
+  configurationErrorReason String?
+
+  actualValue  Decimal?     @db.Decimal(14, 2)
+  actualSource ActualSource @default(MANUAL)
+  enteredById  String?
+  enteredBy    User?        @relation("ActualEnteredBy", fields: [enteredById], references: [id])
+  updatedAt    DateTime     @updatedAt
+
+  @@unique([reviewId, kpiId])
+  @@map("review_kpi_actuals")
+}
+
+/// ReviewEvaluator — مساهمة مقيّم واحد داخل مراجعة أداء واحدة، بوزن مجمَّد
+/// وقت فتح الدورة (لا يُقرأ ديناميكيًا من الإعدادات الحالية بعد ذلك) - §3 من المراجعة.
+model ReviewEvaluator {
+  id            String                    @id @default(cuid())
+  reviewId      String
+  review        PerformanceReview         @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  evaluatorId   String
+  evaluator     User                      @relation("ReviewEvaluatorUser", fields: [evaluatorId], references: [id])
+  weightSnapshot Decimal                  @db.Decimal(5, 2)
+  status        EvaluatorSubmissionStatus @default(NOT_STARTED)
+  overallScore      Decimal? @db.Decimal(4, 2)
+  overallPercentage Decimal? @db.Decimal(6, 2)
+  submittedAt   DateTime?
+  lockedAt      DateTime?
+  reopenedAt    DateTime?
+  reopenReason  String?
+  createdAt     DateTime                  @default(now())
+  updatedAt     DateTime                  @updatedAt
+
+  items       ReviewEvaluatorItem[]
+  attachments ReviewAttachment[]
+  comments    ReviewComment[]
+
+  @@unique([reviewId, evaluatorId])
+  @@index([reviewId, status])
+  @@index([evaluatorId])
+  @@map("review_evaluators")
+}
+
+/// ReviewEvaluatorItem — الرأي الذاتي لمقيّم واحد حول مؤشر واحد: Rating، تبرير،
+/// ملاحظات، والنتيجة المحسوبة الخاصة بهذا المقيّم (مطابقة للجميع في المؤشرات
+/// الموضوعية لأنها مبنية على ReviewKpiActual المشترك، ومختلفة في مؤشرات Rating).
+model ReviewEvaluatorItem {
+  id                String          @id @default(cuid())
+  reviewEvaluatorId String
+  reviewEvaluator   ReviewEvaluator @relation(fields: [reviewEvaluatorId], references: [id], onDelete: Cascade)
+  kpiId             String
+  kpi               Kpi             @relation(fields: [kpiId], references: [id])
+  ratingValue       Int?
+  achievementPct    Decimal?        @db.Decimal(7, 2)
+  scoreContribution Decimal?        @db.Decimal(6, 2)
+  justification     String?
+  notes             String?
+  updatedAt         DateTime        @updatedAt
+
+  subcriteriaScores ReviewEvaluatorSubcriterionScore[]
+
+  @@unique([reviewEvaluatorId, kpiId])
+  @@map("review_evaluator_items")
+}
+
+model ReviewEvaluatorSubcriterionScore {
+  id                    String              @id @default(cuid())
+  reviewEvaluatorItemId String
+  reviewEvaluatorItem   ReviewEvaluatorItem @relation(fields: [reviewEvaluatorItemId], references: [id], onDelete: Cascade)
+  subcriterionId        String
+  subcriterion          KpiSubcriterion     @relation(fields: [subcriterionId], references: [id])
+  rating                Int
+  justification         String
+
+  @@unique([reviewEvaluatorItemId, subcriterionId])
+  @@map("review_evaluator_subcriteria_scores")
+}
+
+model ReviewAttachment {
+  id                String          @id @default(cuid())
+  reviewEvaluatorId String
+  reviewEvaluator   ReviewEvaluator @relation(fields: [reviewEvaluatorId], references: [id], onDelete: Cascade)
+  kpiId             String?
+  fileName          String
+  filePath          String
+  mimeType          String
+  fileSize          Int
+  uploadedById      String
+  uploadedBy        User            @relation(fields: [uploadedById], references: [id])
+  createdAt         DateTime        @default(now())
+
+  @@index([reviewEvaluatorId])
+  @@map("review_attachments")
+}
+
+model ReviewComment {
+  id                String          @id @default(cuid())
+  reviewEvaluatorId String
+  reviewEvaluator   ReviewEvaluator @relation(fields: [reviewEvaluatorId], references: [id], onDelete: Cascade)
+  authorId          String
+  author            User            @relation(fields: [authorId], references: [id])
+  body              String
+  createdAt         DateTime        @default(now())
+
+  @@index([reviewEvaluatorId])
+  @@map("review_comments")
+}
+
+// ==========================================================================
+// النظام
+// ==========================================================================
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  type      String
+  title     String
+  body      String
+  isRead    Boolean  @default(false)
+  link      String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+/// beforeData/afterData تمر إلزاميًا عبر طبقة تنقية (sanitize) تحذف كلمات المرور
+/// والرموز والأسرار قبل الحفظ - §21 من المراجعة. راجع src/lib/audit.ts
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String
+  entity     String
+  entityId   String?
+  ipAddress  String?
+  beforeData Json?
+  afterData  Json?
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+model PerformanceLabel {
+  id        String  @id @default(cuid())
+  label     String
+  minPct    Decimal @db.Decimal(5, 2)
+  maxPct    Decimal @db.Decimal(5, 2)
+  colorHex  String?
+  sortOrder Int     @default(0)
+
+  @@map("performance_labels")
+}
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+model ExcelImportBatch {
+  id           String   @id @default(cuid())
+  fileName     String
+  importedById String
+  totalRows    Int
+  readyRows    Int
+  warningRows  Int
+  errorRows    Int
+  confirmed    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  rows ExcelImportRow[]
+
+  @@map("excel_import_batches")
+}
+
+model ExcelImportRow {
+  id           String           @id @default(cuid())
+  batchId      String
+  batch        ExcelImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  rowNumber    Int
+  rawData      Json
+  resolvedData Json?
+  status       ImportRowStatus
+  messages     String[]
+  employeeId   String?
+
+  @@index([batchId])
+  @@map("excel_import_rows")
+}
