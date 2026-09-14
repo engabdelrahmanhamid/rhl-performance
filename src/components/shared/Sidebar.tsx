@@ -65,6 +65,7 @@ export default function Sidebar({ role }: { role: "SUPER_ADMIN" | "EVALUATOR" })
             <Link
               key={link.href}
               href={link.href}
+              prefetch={false}
               className={clsx(
                 "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition",
                 active ? "bg-primary-50 text-primary-700" : "text-slate-600 hover:bg-slate-50"
