@@ -98,163 +98,214 @@ export async function getCycleOpenReadiness(cycleId: string): Promise<CycleReadi
  * ينشئ PerformanceReview + ReviewKpiActual + ReviewEvaluator (+ العناصر الفارغة) لكل موظف
  * "جاهز" (له قالب مفعّل ومقيّم واحد على الأقل بمجموع أوزان صحيح)، ويترك الموظفين غير الجاهزين
  * بلا مراجعة في هذه الدورة (يظهرون كتحذير للإدارة قبل الفتح). العملية بأكملها ذرية.
+ *
+ * أداء حرج: كل القراءات (فروع/أقسام/مسميات/قوالب/أهداف/مراجعات موجودة مسبقًا) تُجلَب دفعة
+ * واحدة قبل المعاملة، والكتابات كلها عبر createMany/createManyAndReturn دفعة واحدة عبر كل
+ * الموظفين معًا - وليس استعلامًا منفصلاً لكل موظف كما كان سابقًا. هذا ليس تحسينًا اختياريًا:
+ * النسخة القديمة (استعلام لكل موظف داخل حلقة) فشلت فعليًا على بيانات إنتاج حقيقية (23 موظفًا)
+ * بعد 77 ثانية بخطأ Prisma P2028 ("Transaction not found") لأن طول المعاملة (مئات الاستعلامات
+ * المتتالية × زمن استجابة الشبكة لقاعدة بيانات بعيدة) تجاوز ما يسمح به مُجمِّع اتصالات Supabase.
  */
 export async function materializeEvaluationsForCycle(cycleId: string) {
   const cycle = await prisma.evaluationCycle.findUniqueOrThrow({ where: { id: cycleId } });
-  const readiness = await getCycleOpenReadiness(cycleId);
+  // نستخدم getAssignmentCoverage مباشرة بدل getCycleOpenReadiness لتفادي فحص وجود الدورة
+  // المكرَّر (سبق التحقق أعلاه) - كل جولة إضافية للشبكة لها تكلفة حقيقية مع قاعدة بيانات بعيدة.
+  const readiness = await getAssignmentCoverage();
   const readyIds = readiness.filter((r) => r.isReady).map((r) => r.employeeId);
 
-  const employees = await prisma.employee.findMany({
-    where: { id: { in: readyIds } },
-    include: { jobTitle: { include: { kpiTemplates: { where: { isActive: true } } } } },
-  });
+  const [employees, assignments] = await Promise.all([
+    prisma.employee.findMany({
+      where: { id: { in: readyIds } },
+      include: { jobTitle: { include: { kpiTemplates: { where: { isActive: true } } } } },
+    }),
+    prisma.evaluatorAssignment.findMany({
+      where: { isActive: true },
+      include: { rules: true, specificEmployees: { select: { employeeId: true } } },
+    }) as Promise<AssignmentWithRules[]>,
+  ]);
 
-  const assignments: AssignmentWithRules[] = await prisma.evaluatorAssignment.findMany({
-    where: { isActive: true },
-    include: { rules: true, specificEmployees: { select: { employeeId: true } } },
-  });
+  if (employees.length === 0) {
+    return { reviewsCreated: 0, reviewsSkippedExisting: 0, readiness };
+  }
+
+  const templateIds = [...new Set(employees.map((e) => e.jobTitle.kpiTemplates[0]?.id).filter((id): id is string => !!id))];
+
+  const [templatesWithKpis, allBranches, allDepartments, allJobTitles, existingReviews] = await Promise.all([
+    prisma.kpiTemplate.findMany({ where: { id: { in: templateIds } }, include: { kpis: { where: { isActive: true } } } }),
+    prisma.branch.findMany(),
+    prisma.department.findMany(),
+    prisma.jobTitle.findMany(),
+    prisma.performanceReview.findMany({ where: { cycleId, employeeId: { in: readyIds } }, select: { employeeId: true } }),
+  ]);
+
+  const kpisByTemplateId = new Map(templatesWithKpis.map((t) => [t.id, t.kpis]));
+  const branchById = new Map(allBranches.map((b) => [b.id, b]));
+  const departmentById = new Map(allDepartments.map((d) => [d.id, d]));
+  const jobTitleById = new Map(allJobTitles.map((j) => [j.id, j]));
+  const existingEmployeeIds = new Set(existingReviews.map((r) => r.employeeId));
+
+  const allNumericKpiIds = templatesWithKpis.flatMap((t) =>
+    t.kpis
+      .filter((k) => k.measurementType === "NUMBER" || k.measurementType === "PERCENTAGE" || k.measurementType === "CURRENCY")
+      .map((k) => k.id)
+  );
+  const allTargets =
+    allNumericKpiIds.length > 0
+      ? await prisma.target.findMany({ where: { kpiId: { in: allNumericKpiIds }, month: cycle.month, year: cycle.year } })
+      : [];
+  const targetsByKpiId = new Map<string, typeof allTargets>();
+  for (const t of allTargets) {
+    const list = targetsByKpiId.get(t.kpiId) ?? [];
+    list.push(t);
+    targetsByKpiId.set(t.kpiId, list);
+  }
+
+  const employeesToProcess = employees.filter((e) => !existingEmployeeIds.has(e.id));
+  const reviewsSkippedExisting = employees.length - employeesToProcess.length;
+
+  if (employeesToProcess.length === 0) {
+    return { reviewsCreated: 0, reviewsSkippedExisting, readiness };
+  }
 
   let reviewsCreated = 0;
-  let reviewsSkippedExisting = 0;
 
   await prisma.$transaction(
     async (tx) => {
-      for (const emp of employees) {
-        const existingReview = await tx.performanceReview.findUnique({
-          where: { cycleId_employeeId: { cycleId, employeeId: emp.id } },
-        });
-        if (existingReview) {
-          reviewsSkippedExisting++;
-          continue;
-        }
-
+      // --- 1) PerformanceReview لكل الموظفين دفعة واحدة ---
+      const reviewInputs: Prisma.PerformanceReviewCreateManyInput[] = employeesToProcess.map((emp) => {
         const template = emp.jobTitle.kpiTemplates[0];
-        const kpis = await tx.kpi.findMany({
-          where: { kpiTemplateId: template.id, isActive: true },
-          include: { subcriteria: true },
-        });
+        const branch = branchById.get(emp.branchId)!;
+        const department = emp.departmentId ? (departmentById.get(emp.departmentId) ?? null) : null;
+        const jobTitle = jobTitleById.get(emp.jobTitleId)!;
+        return {
+          cycleId,
+          employeeId: emp.id,
+          employeeNumberSnapshot: emp.employeeNumber,
+          employeeNameSnapshot: emp.fullName,
+          branchIdSnapshot: branch.id,
+          branchNameSnapshot: branch.name,
+          departmentIdSnapshot: department?.id ?? null,
+          departmentNameSnapshot: department?.name ?? null,
+          jobTitleIdSnapshot: jobTitle.id,
+          jobTitleNameSnapshot: jobTitle.name,
+          kpiTemplateId: template.id,
+          templateVersionSnapshot: template.version,
+          status: "NOT_STARTED",
+        };
+      });
 
-        const matchingAssignments = assignments.filter((a) => assignmentCoversEmployee(a, emp));
+      const createdReviews = await tx.performanceReview.createManyAndReturn({ data: reviewInputs });
+      reviewsCreated = createdReviews.length;
+      const reviewIdByEmployeeId = new Map(createdReviews.map((r) => [r.employeeId, r.id]));
 
-        // الفروع/الأقسام/المسميات ضمن Snapshot يجب جلبها من الكيانات الفعلية وقت الفتح فقط
-        const [branch, department, jobTitle] = await Promise.all([
-          tx.branch.findUniqueOrThrow({ where: { id: emp.branchId } }),
-          emp.departmentId ? tx.department.findUnique({ where: { id: emp.departmentId } }) : null,
-          tx.jobTitle.findUniqueOrThrow({ where: { id: emp.jobTitleId } }),
-        ]);
+      const kpisByReviewId = new Map<string, (typeof templatesWithKpis)[number]["kpis"]>();
+      for (const emp of employeesToProcess) {
+        const reviewId = reviewIdByEmployeeId.get(emp.id)!;
+        const template = emp.jobTitle.kpiTemplates[0];
+        kpisByReviewId.set(reviewId, kpisByTemplateId.get(template.id) ?? []);
+      }
 
-        const review = await tx.performanceReview.create({
-          data: {
-            cycleId,
-            employeeId: emp.id,
-            employeeNumberSnapshot: emp.employeeNumber,
-            employeeNameSnapshot: emp.fullName,
-            branchIdSnapshot: branch.id,
-            branchNameSnapshot: branch.name,
-            departmentIdSnapshot: department?.id ?? null,
-            departmentNameSnapshot: department?.name ?? null,
-            jobTitleIdSnapshot: jobTitle.id,
-            jobTitleNameSnapshot: jobTitle.name,
-            kpiTemplateId: template.id,
-            templateVersionSnapshot: template.version,
-            status: "NOT_STARTED",
-          },
-        });
-        reviewsCreated++;
-
-        // --- ReviewKpiActual: سجل واحد فقط لكل مؤشر رقمي (NUMBER/PERCENTAGE/CURRENCY) ---
+      // --- 2) ReviewKpiActual لكل الموظفين دفعة واحدة ---
+      const kpiActualInputs: Prisma.ReviewKpiActualCreateManyInput[] = [];
+      for (const emp of employeesToProcess) {
+        const reviewId = reviewIdByEmployeeId.get(emp.id)!;
+        const kpis = kpisByReviewId.get(reviewId) ?? [];
         const numericKpis = kpis.filter(
           (k) => k.measurementType === "NUMBER" || k.measurementType === "PERCENTAGE" || k.measurementType === "CURRENCY"
         );
 
-        if (numericKpis.length > 0) {
-          const kpiIds = numericKpis.map((k) => k.id);
-          const allTargets = await tx.target.findMany({
-            where: { kpiId: { in: kpiIds }, month: cycle.month, year: cycle.year },
-          });
+        const employeeContext: EmployeeContext = {
+          employeeId: emp.id,
+          branchId: emp.branchId,
+          departmentId: emp.departmentId,
+          jobTitleId: emp.jobTitleId,
+        };
 
-          const employeeContext: EmployeeContext = {
-            employeeId: emp.id,
-            branchId: emp.branchId,
-            departmentId: emp.departmentId,
-            jobTitleId: emp.jobTitleId,
-          };
+        for (const kpi of numericKpis) {
+          const targetRecords: TargetRecord[] = (targetsByKpiId.get(kpi.id) ?? []).map((t) => ({
+            scopeType: t.scopeType as TargetScopeType,
+            scopeKey: t.scopeKey,
+            applicationMode: t.applicationMode,
+            branchId: t.branchId,
+            departmentId: t.departmentId,
+            jobTitleId: t.jobTitleId,
+            employeeId: t.employeeId,
+            value: Number(t.value),
+          }));
 
-          for (const kpi of numericKpis) {
-            const targetRecords: TargetRecord[] = allTargets
-              .filter((t) => t.kpiId === kpi.id)
-              .map((t) => ({
-                scopeType: t.scopeType as TargetScopeType,
-                scopeKey: t.scopeKey,
-                applicationMode: t.applicationMode,
-                branchId: t.branchId,
-                departmentId: t.departmentId,
-                jobTitleId: t.jobTitleId,
-                employeeId: t.employeeId,
-                value: Number(t.value),
-              }));
+          const resolved = resolveEffectiveTarget(targetRecords, employeeContext);
 
-            const resolved = resolveEffectiveTarget(targetRecords, employeeContext);
+          let targetValueSnapshot: number | null = null;
+          let targetScopeLevelSnapshot: TargetScopeType | null = null;
+          let isConfigurationError = false;
+          let configurationErrorReason: string | null = null;
 
-            let targetValueSnapshot: number | null = null;
-            let targetScopeLevelSnapshot: TargetScopeType | null = null;
-            let isConfigurationError = false;
-            let configurationErrorReason: string | null = null;
-
-            if (!resolved) {
+          if (!resolved) {
+            isConfigurationError = true;
+            configurationErrorReason =
+              "لا يوجد هدف مُعرَّف لهذا المؤشر على أي مستوى (موظف/مسمى وظيفي/قسم/فرع/عام) لهذا الشهر - راجع الإدارة";
+          } else {
+            targetValueSnapshot = resolved.value;
+            targetScopeLevelSnapshot = resolved.sourceLevel;
+            if (kpi.direction === "HIGHER_IS_BETTER" && resolved.value <= 0) {
               isConfigurationError = true;
-              configurationErrorReason =
-                "لا يوجد هدف مُعرَّف لهذا المؤشر على أي مستوى (موظف/مسمى وظيفي/قسم/فرع/عام) لهذا الشهر - راجع الإدارة";
-            } else {
-              targetValueSnapshot = resolved.value;
-              targetScopeLevelSnapshot = resolved.sourceLevel;
-              if (kpi.direction === "HIGHER_IS_BETTER" && resolved.value <= 0) {
-                isConfigurationError = true;
-                configurationErrorReason =
-                  'الهدف يجب أن يكون أكبر من صفر لمؤشر من نوع "الأعلى أفضل" - راجع الإدارة';
-              }
+              configurationErrorReason = 'الهدف يجب أن يكون أكبر من صفر لمؤشر من نوع "الأعلى أفضل" - راجع الإدارة';
             }
-
-            await tx.reviewKpiActual.create({
-              data: {
-                reviewId: review.id,
-                kpiId: kpi.id,
-                kpiNameSnapshot: kpi.name,
-                kpiWeightSnapshot: kpi.weight,
-                kpiDirectionSnapshot: kpi.direction,
-                kpiMeasurementTypeSnapshot: kpi.measurementType,
-                targetValueSnapshot,
-                targetScopeLevelSnapshot,
-                isConfigurationError,
-                configurationErrorReason,
-              },
-            });
           }
-        }
 
-        // --- ReviewEvaluator + ReviewEvaluatorItem (فارغة) لكل تعيين مطابق ---
-        for (const assignment of matchingAssignments) {
-          const reviewEvaluator = await tx.reviewEvaluator.create({
-            data: {
-              reviewId: review.id,
-              evaluatorId: assignment.evaluatorId,
-              weightSnapshot: assignment.defaultWeight,
-              status: "NOT_STARTED",
-            },
+          kpiActualInputs.push({
+            reviewId,
+            kpiId: kpi.id,
+            kpiNameSnapshot: kpi.name,
+            kpiWeightSnapshot: kpi.weight,
+            kpiDirectionSnapshot: kpi.direction,
+            kpiMeasurementTypeSnapshot: kpi.measurementType,
+            targetValueSnapshot,
+            targetScopeLevelSnapshot,
+            isConfigurationError,
+            configurationErrorReason,
           });
-
-          for (const kpi of kpis) {
-            await tx.reviewEvaluatorItem.create({
-              data: {
-                reviewEvaluatorId: reviewEvaluator.id,
-                kpiId: kpi.id,
-              },
-            });
-          }
         }
       }
+
+      if (kpiActualInputs.length > 0) {
+        await tx.reviewKpiActual.createMany({ data: kpiActualInputs });
+      }
+
+      // --- 3) ReviewEvaluator لكل تعيين مطابق عبر كل الموظفين دفعة واحدة ---
+      const reviewEvaluatorInputs: Prisma.ReviewEvaluatorCreateManyInput[] = [];
+      for (const emp of employeesToProcess) {
+        const reviewId = reviewIdByEmployeeId.get(emp.id)!;
+        const matchingAssignments = assignments.filter((a) => assignmentCoversEmployee(a, emp));
+        for (const assignment of matchingAssignments) {
+          reviewEvaluatorInputs.push({
+            reviewId,
+            evaluatorId: assignment.evaluatorId,
+            weightSnapshot: assignment.defaultWeight,
+            status: "NOT_STARTED",
+          });
+        }
+      }
+
+      const createdReviewEvaluators =
+        reviewEvaluatorInputs.length > 0 ? await tx.reviewEvaluator.createManyAndReturn({ data: reviewEvaluatorInputs }) : [];
+
+      // --- 4) ReviewEvaluatorItem الفارغة لكل (مقيّم × مؤشر) دفعة واحدة ---
+      const reviewEvaluatorItemInputs: Prisma.ReviewEvaluatorItemCreateManyInput[] = [];
+      for (const re of createdReviewEvaluators) {
+        const kpis = kpisByReviewId.get(re.reviewId) ?? [];
+        for (const kpi of kpis) {
+          reviewEvaluatorItemInputs.push({ reviewEvaluatorId: re.id, kpiId: kpi.id });
+        }
+      }
+
+      if (reviewEvaluatorItemInputs.length > 0) {
+        await tx.reviewEvaluatorItem.createMany({ data: reviewEvaluatorItemInputs });
+      }
     },
-    { timeout: 60_000 }
+    // 120 ثانية بدل 60 - هامش أمان إضافي لبطء اتصال Postgres الخارجي (Supabase) المُلاحَظ فعليًا؛
+    // بعد إصلاح انفجار عدد الجولات (batching)، الوقت الفعلي المتوقَّع أقل بكثير من هذا الحد.
+    { timeout: 120_000 }
   );
 
   return { reviewsCreated, reviewsSkippedExisting, readiness };

@@ -125,26 +125,33 @@ export async function confirmImport(batchId: string) {
 
   if (batch.confirmed) throw new Error("تم تأكيد هذا الاستيراد مسبقًا");
 
-  const importable = batch.rows.filter((r) => r.status !== "ERROR" && r.resolvedData);
-  let imported = 0;
+  type ResolvedRow = {
+    employeeNumber: string;
+    fullName: string;
+    branchId: string;
+    departmentId: string | null;
+    jobTitleId: string;
+    status: "ACTIVE" | "INACTIVE";
+    hireDate: string;
+  };
+  const importable = batch.rows
+    .filter((row) => row.status !== "ERROR" && row.resolvedData)
+    .map((row) => row.resolvedData as ResolvedRow);
 
-  for (const row of importable) {
-    const r = row.resolvedData as {
-      employeeNumber: string;
-      fullName: string;
-      branchId: string;
-      departmentId: string | null;
-      jobTitleId: string;
-      status: "ACTIVE" | "INACTIVE";
-      hireDate: string;
-    };
+  // إعادة تحقق أخيرة من عدم التكرار دفعة واحدة (دفاع إضافي ضد استيراد آخر جرى بين المعاينة
+  // والتأكيد) بدل استعلام + إنشاء منفصلَين لكل صف - أداء حرج مع قاعدة بيانات خارجية بعيدة
+  // (كل جولة شبكة إضافية مكلفة)؛ نفس مبدأ إصلاح فتح الدورة في cycleOpening.ts.
+  const employeeNumbers = importable.map((r) => r.employeeNumber);
+  const existing = await prisma.employee.findMany({
+    where: { employeeNumber: { in: employeeNumbers } },
+    select: { employeeNumber: true },
+  });
+  const existingNumbers = new Set(existing.map((e) => e.employeeNumber));
+  const toCreate = importable.filter((r) => !existingNumbers.has(r.employeeNumber));
 
-    // إعادة تحقق أخيرة من عدم التكرار (دفاع إضافي ضد استيراد آخر جرى بين المعاينة والتأكيد)
-    const exists = await prisma.employee.findUnique({ where: { employeeNumber: r.employeeNumber } });
-    if (exists) continue;
-
-    await prisma.employee.create({
-      data: {
+  if (toCreate.length > 0) {
+    await prisma.employee.createMany({
+      data: toCreate.map((r) => ({
         employeeNumber: r.employeeNumber,
         fullName: r.fullName,
         branchId: r.branchId,
@@ -152,10 +159,10 @@ export async function confirmImport(batchId: string) {
         jobTitleId: r.jobTitleId,
         employmentStatus: r.status,
         hireDate: new Date(r.hireDate),
-      },
+      })),
     });
-    imported++;
   }
+  const imported = toCreate.length;
 
   await prisma.excelImportBatch.update({ where: { id: batchId }, data: { confirmed: true } });
 
