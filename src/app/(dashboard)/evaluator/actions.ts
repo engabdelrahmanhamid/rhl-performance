@@ -121,9 +121,9 @@ export async function saveSubcriterionScore(
   const session = await requireEvaluator();
   const reviewEvaluator = await assertOwnedReviewEvaluator(reviewEvaluatorId, session.user.id);
 
-  if (!justification || justification.trim().length === 0) {
-    throw new Error("التبرير إلزامي لأي تقييم فرعي");
-  }
+  // الحفظ التلقائي (autosave) يحفظ فورًا دون حجب - إلزامية التبرير للتقييمات المنخفضة (<3)
+  // تُفرَض عند محاولة الإرسال النهائي فقط (validateReviewEvaluatorForSubmit)، لتفادي فقدان
+  // التقييم صامتًا لو كتب المقيّم التبرير بعد اختيار الرقم بدل قبله.
 
   const item = await prisma.reviewEvaluatorItem.findUniqueOrThrow({
     where: { reviewEvaluatorId_kpiId: { reviewEvaluatorId, kpiId } },

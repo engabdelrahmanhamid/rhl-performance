@@ -174,14 +174,16 @@ export async function validateReviewEvaluatorForSubmit(reviewEvaluatorId: string
 
     if (kpi.measurementType === "RATING_1_5") {
       if (!item || item.ratingValue === null) issues.push({ kpiId: kpi.id, kpiName: kpi.name, message: "التقييم (1-5) مطلوب" });
-      else if (!item.justification) issues.push({ kpiId: kpi.id, kpiName: kpi.name, message: "التبرير إلزامي لأي تقييم" });
+      else if (item.ratingValue < 3 && !item.justification)
+        issues.push({ kpiId: kpi.id, kpiName: kpi.name, message: "التبرير إلزامي للتقييمات المنخفضة (أقل من 3)" });
     } else if (kpi.measurementType === "SUBCRITERIA_RATING") {
       const requiredSubIds = kpi.subcriteria.map((s) => s.id);
       const providedSubIds = item?.subcriteriaScores.map((s) => s.subcriterionId) ?? [];
       const missing = requiredSubIds.filter((id) => !providedSubIds.includes(id));
       if (missing.length > 0) issues.push({ kpiId: kpi.id, kpiName: kpi.name, message: `${missing.length} معيار فرعي غير مكتمل` });
-      const missingJustification = item?.subcriteriaScores.some((s) => !s.justification) ?? false;
-      if (missingJustification) issues.push({ kpiId: kpi.id, kpiName: kpi.name, message: "التبرير إلزامي لكل معيار فرعي" });
+      const missingJustification = item?.subcriteriaScores.some((s) => s.rating < 3 && !s.justification) ?? false;
+      if (missingJustification)
+        issues.push({ kpiId: kpi.id, kpiName: kpi.name, message: "التبرير إلزامي للمعايير الفرعية ذات التقييم المنخفض (أقل من 3)" });
     } else {
       const actual = actuals.find((a) => a.kpiId === kpi.id);
       if (!actual || actual.isConfigurationError) {

@@ -60,9 +60,11 @@ export default function KpiCard({
     Object.fromEntries(item.subcriteriaScores.map((s) => [s.subcriterionId, { rating: s.rating, justification: s.justification }]))
   );
   const [saved, setSaved] = useState(false);
+  const [subErrors, setSubErrors] = useState<Record<string, string | undefined>>({});
   const [pending, startTransition] = useTransition();
   const actualDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fieldsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const subDebounceRefs = useRef<Record<string, ReturnType<typeof setTimeout> | null>>({});
 
   function markSaved() {
     setSaved(true);
@@ -104,6 +106,7 @@ export default function KpiCard({
     () => () => {
       if (actualDebounceRef.current) clearTimeout(actualDebounceRef.current);
       if (fieldsDebounceRef.current) clearTimeout(fieldsDebounceRef.current);
+      Object.values(subDebounceRefs.current).forEach((t) => t && clearTimeout(t));
     },
     []
   );
@@ -112,13 +115,29 @@ export default function KpiCard({
   const isSubcriteria = kpi.measurementType === "SUBCRITERIA_RATING";
   const isNumeric = !isRating && !isSubcriteria;
 
-  async function handleSubScoreChange(subId: string, rating: number, just: string) {
+  function handleSubScoreChange(subId: string, rating: number, just: string, debounce: boolean) {
     setSubScores((prev) => ({ ...prev, [subId]: { rating, justification: just } }));
-    if (!just.trim()) return; // لا نحفظ بدون تبرير - الحقل إلزامي
-    startTransition(async () => {
-      await saveSubcriterionScore(reviewEvaluatorId, kpi.id, subId, rating, just);
-      markSaved();
-    });
+    setSubErrors((prev) => ({ ...prev, [subId]: undefined }));
+
+    const existingTimeout = subDebounceRefs.current[subId];
+    if (existingTimeout) clearTimeout(existingTimeout);
+
+    const save = () => {
+      startTransition(async () => {
+        try {
+          await saveSubcriterionScore(reviewEvaluatorId, kpi.id, subId, rating, just);
+          markSaved();
+        } catch (err) {
+          setSubErrors((prev) => ({ ...prev, [subId]: err instanceof Error ? err.message : "تعذّر الحفظ" }));
+        }
+      });
+    };
+
+    if (debounce) {
+      subDebounceRefs.current[subId] = setTimeout(save, 700);
+    } else {
+      save();
+    }
   }
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -184,16 +203,44 @@ export default function KpiCard({
           <label className="label-field">
             القيمة الفعلية (Actual) <span className="text-xs font-normal text-slate-400">- مشتركة بين كل المقيّمين</span>
           </label>
-          <input
-            type="number"
-            step="0.01"
-            className="input-field max-w-xs"
-            value={actualValue}
-            onChange={(e) => {
-              setActualValue(e.target.value);
-              scheduleSaveActual(e.target.value);
-            }}
-          />
+          {kpi.measurementType === "PERCENTAGE" ? (
+            <div className="flex max-w-md items-center gap-3">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={0.5}
+                className="flex-1"
+                value={actualValue === "" ? 0 : Number(actualValue)}
+                onChange={(e) => {
+                  setActualValue(e.target.value);
+                  scheduleSaveActual(e.target.value);
+                }}
+              />
+              <input
+                type="number"
+                step="0.01"
+                className="input-field w-24 shrink-0"
+                value={actualValue}
+                onChange={(e) => {
+                  setActualValue(e.target.value);
+                  scheduleSaveActual(e.target.value);
+                }}
+              />
+              <span className="shrink-0 text-sm text-slate-500">%</span>
+            </div>
+          ) : (
+            <input
+              type="number"
+              step="0.01"
+              className="input-field max-w-xs"
+              value={actualValue}
+              onChange={(e) => {
+                setActualValue(e.target.value);
+                scheduleSaveActual(e.target.value);
+              }}
+            />
+          )}
         </div>
       )}
 
@@ -223,7 +270,11 @@ export default function KpiCard({
       {(isRating || isNumeric) && (
         <div className="mb-3">
           <label className="label-field">
-            التبرير {isRating && <span className="text-red-500">(إلزامي)</span>}
+            التبرير{" "}
+            {isRating && ratingValue > 0 && ratingValue < 3 && <span className="text-red-500">(إلزامي)</span>}
+            {isRating && ratingValue > 0 && ratingValue < 3 && !justification.trim() && (
+              <span className="mr-2 text-xs font-normal text-red-500">التبرير إلزامي لهذا التقييم المنخفض (أقل من 3)</span>
+            )}
           </label>
           <textarea
             rows={2}
@@ -233,7 +284,7 @@ export default function KpiCard({
               setJustification(e.target.value);
               scheduleSaveFields({ justification: e.target.value });
             }}
-            placeholder="اشرح سبب هذا التقييم..."
+            placeholder={isRating && ratingValue > 0 && ratingValue < 3 ? "التبرير إلزامي لهذا التقييم المنخفض..." : "اشرح سبب هذا التقييم (اختياري)..."}
           />
         </div>
       )}
@@ -242,6 +293,7 @@ export default function KpiCard({
         <div className="mb-3 space-y-3">
           {kpi.subcriteria.map((sub) => {
             const current = subScores[sub.id] ?? { rating: 0, justification: "" };
+            const needsJustification = current.rating > 0 && current.rating < 3;
             return (
               <div key={sub.id} className="rounded-xl border border-slate-200 p-3">
                 <div className="mb-2 flex items-center justify-between">
@@ -253,7 +305,7 @@ export default function KpiCard({
                       <button
                         key={n}
                         type="button"
-                        onClick={() => handleSubScoreChange(sub.id, n, current.justification)}
+                        onClick={() => handleSubScoreChange(sub.id, n, current.justification, false)}
                         className={`flex h-8 w-8 items-center justify-center rounded-lg border text-xs font-semibold ${
                           current.rating === n ? "border-primary-600 bg-primary-600 text-white" : "border-slate-300 text-slate-600"
                         }`}
@@ -266,10 +318,14 @@ export default function KpiCard({
                 <textarea
                   rows={2}
                   className="input-field"
-                  placeholder="التبرير إلزامي..."
+                  placeholder={needsJustification ? "التبرير إلزامي لهذا التقييم المنخفض..." : "ملاحظة (اختياري)..."}
                   value={current.justification}
-                  onChange={(e) => handleSubScoreChange(sub.id, current.rating || 0, e.target.value)}
+                  onChange={(e) => handleSubScoreChange(sub.id, current.rating || 0, e.target.value, true)}
                 />
+                {needsJustification && !current.justification.trim() && (
+                  <div className="mt-1 text-xs text-red-500">التبرير إلزامي لهذا التقييم المنخفض (أقل من 3)</div>
+                )}
+                {subErrors[sub.id] && <div className="mt-1 text-xs text-red-500">{subErrors[sub.id]}</div>}
               </div>
             );
           })}
