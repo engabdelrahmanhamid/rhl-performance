@@ -14,7 +14,11 @@ const LEVEL_LABELS: Record<string, string> = {
 
 export default async function TargetsPage() {
   const [kpis, branches, departments, jobTitles, employees, targets] = await Promise.all([
-    prisma.kpi.findMany({ include: { kpiTemplate: { include: { jobTitle: true } } }, orderBy: { name: "asc" } }),
+    prisma.kpi.findMany({
+      where: { kpiTemplate: { isActive: true } },
+      include: { kpiTemplate: { include: { jobTitle: true } } },
+      orderBy: { name: "asc" },
+    }),
     prisma.branch.findMany({ where: { isActive: true }, orderBy: { name: "asc" } }),
     prisma.department.findMany({ where: { isActive: true }, orderBy: { name: "asc" } }),
     prisma.jobTitle.findMany({ where: { isActive: true }, orderBy: { name: "asc" } }),
@@ -35,7 +39,12 @@ export default async function TargetsPage() {
 
       <div className="mb-6">
         <TargetForm
-          kpis={kpis.map((k) => ({ id: k.id, name: k.name, jobTitleName: k.kpiTemplate.jobTitle.name }))}
+          kpis={kpis.map((k) => ({
+            id: k.id,
+            name: k.name,
+            jobTitleId: k.kpiTemplate.jobTitleId,
+            jobTitleName: k.kpiTemplate.jobTitle.name,
+          }))}
           branches={branches}
           departments={departments}
           jobTitles={jobTitles}

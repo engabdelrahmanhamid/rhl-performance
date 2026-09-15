@@ -13,7 +13,7 @@ export default function TargetForm({
   jobTitles,
   employees,
 }: {
-  kpis: (Option & { jobTitleName: string })[];
+  kpis: (Option & { jobTitleId: string; jobTitleName: string })[];
   branches: Option[];
   departments: Option[];
   jobTitles: Option[];
@@ -21,9 +21,12 @@ export default function TargetForm({
 }) {
   const formRef = useRef<HTMLFormElement>(null);
   const [level, setLevel] = useState("GLOBAL");
+  const [kpiJobTitleFilter, setKpiJobTitleFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
   const router = useRouter();
+
+  const filteredKpis = kpis.filter((k) => k.jobTitleId === kpiJobTitleFilter);
 
   return (
     <form
@@ -36,6 +39,7 @@ export default function TargetForm({
             await createOrUpdateTarget(formData);
             formRef.current?.reset();
             setLevel("GLOBAL");
+            setKpiJobTitleFilter("");
             router.refresh();
           } catch (err) {
             setError(err instanceof Error ? err.message : "تعذّر حفظ الهدف");
@@ -46,11 +50,30 @@ export default function TargetForm({
       {error && <div className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700 sm:col-span-3">{error}</div>}
 
       <div>
-        <label className="label-field">المؤشر (KPI)</label>
-        <select name="kpiId" required className="input-field">
-          {kpis.map((k) => (
+        <label className="label-field">١. المسمى الوظيفي (لتصفية المؤشرات)</label>
+        <select
+          className="input-field"
+          value={kpiJobTitleFilter}
+          onChange={(e) => setKpiJobTitleFilter(e.target.value)}
+        >
+          <option value="">اختر المسمى الوظيفي أولًا...</option>
+          {jobTitles.map((j) => (
+            <option key={j.id} value={j.id}>
+              {j.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label className="label-field">٢. المؤشر (KPI)</label>
+        <select key={kpiJobTitleFilter} name="kpiId" required className="input-field" defaultValue="">
+          <option value="" disabled>
+            {kpiJobTitleFilter ? "اختر المؤشر..." : "اختر المسمى الوظيفي أولًا"}
+          </option>
+          {filteredKpis.map((k) => (
             <option key={k.id} value={k.id}>
-              {k.jobTitleName} — {k.name}
+              {k.name}
             </option>
           ))}
         </select>
