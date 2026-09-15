@@ -17,6 +17,7 @@ export type AuditAction =
   | "CREATE_CYCLE"
   | "OPEN_CYCLE"
   | "CLOSE_CYCLE"
+  | "DELETE_CYCLE"
   | "CHANGE_TARGET"
   | "CHANGE_ASSIGNMENT"
   | "CHANGE_EVALUATOR_WEIGHT"
